@@ -1,58 +1,110 @@
 import torch
 import torch.nn as nn
+from torch.nn import init
 import torch.nn.functional as F
 from Model.mlp import MLP
 
+
 class Encoder(nn.Module):
-    def __init__(self, features, feature_dim, embed_dim, adj_lists, aggregator,
-                 num_layers=3, num_sample=10, base_model=None, gcn=False, cuda=False, kernel="GCN"):
+    """
+    Encodes a node's using 'convolutional' GraphSage approach
+    """
+
+    def __init__(self, features, feature_dim,
+                 embed_dim, adj_lists, aggregator,
+                 num_sample=10,
+                 base_model=None, gcn=False, cuda=False,
+                 kernel="GCN",
+                 agg_type = "Mean",
+                 feature_transform=False):
         super(Encoder, self).__init__()
-        
-        self.features = features  # Node feature matrix
+
+        self.features = features
         self.feat_dim = feature_dim
-        self.adj_lists = adj_lists  # Adjacency list
-        self.aggregator = aggregator  # Aggregation function
-        self.num_sample = num_sample  # Number of neighbors to sample
-        self.gcn = gcn  # Whether to use GCN-style propagation
-        self.embed_dim = embed_dim  # Embedding dimension
-        self.cuda = cuda  # CUDA flag
-        self.kernel = kernel  # Graph kernel type (GCN, GAT, GIN, etc.)
-        self.device = torch.device("cuda" if cuda else "cpu")  # Device handling
-        
-        if base_model:
-            self.base_model = base_model  # Optional base model for hierarchical learning
-        
-        # Xavier initialization for weight matrix
-        self.weight = nn.Parameter(torch.FloatTensor(embed_dim, feature_dim if gcn else 2 * feature_dim))
-        nn.init.xavier_uniform_(self.weight)
-        
-        # Dynamic layer selection for MLP-based encoding
+        self.adj_lists = adj_lists
+        self.aggregator = aggregator
+        self.agg_type = agg_type
+        self.num_sample = num_sample
+        if base_model != None:
+            self.base_model = base_model
+
+        self.gcn = gcn
+        self.embed_dim = embed_dim
+        self.cuda = cuda
+        self.aggregator.cuda = cuda
+        self.weight = nn.Parameter(
+            torch.FloatTensor(embed_dim, self.feat_dim if self.gcn else 2 * self.feat_dim))
+        init.xavier_uniform(self.weight)
+
+        self.kernel = kernel
+
+        num_mlp_layers = 2
+        num_layers = 5
         self.num_layers = num_layers
-        self.mlps = nn.ModuleList([MLP(2, feature_dim if i == 0 else embed_dim, embed_dim, embed_dim) for i in range(num_layers)])
-        self.batch_norms = nn.ModuleList([nn.BatchNorm1d(embed_dim) for _ in range(num_layers)])
-        self.linears_prediction = nn.ModuleList([nn.Linear(feature_dim if i == 0 else embed_dim, embed_dim) for i in range(num_layers)])
+
+        input_dim = feature_dim
+        hidden_dim = 512
+        output_dim = embed_dim
+        self.mlps = torch.nn.ModuleList()
+        # List of batchnorms applied to the output of MLP (input of the final prediction linear layer)
+        self.batch_norms = torch.nn.ModuleList()
+
+        for layer in range(self.num_layers-1):
+            if layer == 0:
+                self.mlps.append(
+                    MLP(num_mlp_layers, input_dim, hidden_dim, hidden_dim))
+            else:
+                self.mlps.append(
+                    MLP(num_mlp_layers, hidden_dim, hidden_dim, hidden_dim))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        self.mlps.append(
+                    MLP(num_mlp_layers, hidden_dim, hidden_dim, embed_dim))
+        self.batch_norms.append(nn.BatchNorm1d(embed_dim))
+
+        # Linear function that maps the hidden representation at dofferemt layers into a prediction score
+        self.linears_prediction = torch.nn.ModuleList()
+        for layer in range(num_layers):
+            if layer == 0:
+                self.linears_prediction.append(
+                    nn.Linear(input_dim, output_dim))
+            else:
+                self.linears_prediction.append(
+                    nn.Linear(hidden_dim, output_dim))
 
     def forward(self, nodes):
-        nodes = torch.LongTensor(nodes).to(self.device)  # Ensure nodes are on the correct device
-        
-        # GIN Kernel: Uses MLPs and batch norms
+        """
+        Generates embeddings for a batch of nodes.
+
+        nodes     -- list of nodes
+        """
+        # print('encoder:', nodes)
         if self.kernel == "GIN":
-            neigh_feats = self.aggregator(nodes, self.adj_lists[nodes], self.num_sample, average="sum")  # Vectorized adjacency lookup
-            self_feats = self.features(nodes)
-            h = self_feats + neigh_feats  # Element-wise sum
-            for layer in range(self.num_layers):
-                h = F.relu(self.batch_norms[layer](self.mlps[layer](h)))  # MLP with batch norm
-            return h.t()
-        else:
-            neigh_feats = self.aggregator(nodes, self.adj_lists[nodes], self.num_sample)  # Vectorized adjacency lookup
-            
-            if not self.gcn:
-                self_feats = self.features(nodes)
-                combined = torch.cat([self_feats, neigh_feats], dim=1)  # Concatenation for non-GCN models
+            neigh_feats = self.aggregator.forward(nodes, [self.adj_lists[int(node)] for node in nodes],
+                                                  self.num_sample, agg_type="sum")
+            if self.cuda:
+                self_feats = self.features(torch.LongTensor(nodes).cuda())
             else:
-                combined = neigh_feats  # Use neighbor features directly for GCN
-            
-            # GAT Kernel: Uses ELU activation, others use ReLU
+                self_feats = self.features(torch.LongTensor(nodes))
+            h = torch.add(self_feats, neigh_feats)
+            for layer in range(self.num_layers):
+                pooled_rep = self.mlps[layer](h)
+                h = self.batch_norms[layer](pooled_rep)
+                h = F.relu(h)
+            combined = h.t()
+        else:
+            neigh_feats = self.aggregator.forward(nodes, [self.adj_lists[int(node)] for node in nodes],
+                                                  self.num_sample,agg_type= self.agg_type)
+            if not self.gcn:
+                if self.cuda:
+                    self_feats = self.features(torch.LongTensor(nodes).cuda())
+                else:
+                    self_feats = self.features(torch.LongTensor(nodes))
+                combined = torch.cat([self_feats, neigh_feats], dim=1)
+            else:
+                combined = neigh_feats
+
             if self.kernel == "GAT":
-                return F.elu(self.weight @ combined.t())
-            return F.relu(self.weight @ combined.t())
+                combined = F.elu(self.weight.mm(combined.t()))
+            else:
+                combined = F.relu(self.weight.mm(combined.t()))
+        return combined

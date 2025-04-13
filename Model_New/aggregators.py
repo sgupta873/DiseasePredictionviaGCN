@@ -1,219 +1,191 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.nn import init
 import random
+
 
 class MeanAggregator(nn.Module):
     """
-    Aggregates a node's embeddings by computing the mean of its neighbors' embeddings.
-    Supports different graph kernels: GCN, GAT, and GIN.
+    Computes mean-based or attention-based aggregation of neighboring node features.
     """
 
-    def __init__(self, features, feature_dim=4096, use_cuda=False, gcn_mode=False, kernel="GCN"):
+    def __init__(self, features_fn, features_dim=4096, use_cuda=False, gcn_style=False, mode="GCN"):
         """
-        Args:
-            features (callable): Function mapping node IDs to feature tensors.
-            feature_dim (int): Feature vector size.
-            use_cuda (bool): If True, moves computations to GPU.
-            gcn_mode (bool): If True, aggregates self-looped features like GCN.
-            kernel (str): Graph aggregation type ("GCN", "GAT", "GIN").
+        features_fn: function that maps node indices to feature tensors
+        features_dim: dimensionality of the input/output features
+        use_cuda: use GPU if True
+        gcn_style: whether to include self-loops (like GCN) or not
+        mode: "GCN", "GAT", or "GIN" to switch aggregation mechanism
         """
         super(MeanAggregator, self).__init__()
 
-        self.features = features
-        self.device = torch.device("cuda" if use_cuda else "cpu")
-        self.gcn_mode = gcn_mode
-        self.kernel = kernel
+        self.features_fn = features_fn
+        self.use_cuda = use_cuda
+        self.gcn_style = gcn_style
+        self.mode = mode
+        self.attention_enabled = True if mode == "GAT" else False
 
-        # Only needed for GAT (Graph Attention Network)
-        self.use_attention = kernel == "GAT"
-        self.weight = nn.Parameter(torch.FloatTensor(feature_dim, feature_dim))
-        self.attention_vector = nn.Parameter(torch.FloatTensor(2 * feature_dim, 1))
+        self.in_features = features_dim
+        self.out_features = features_dim
 
-        # Activation functions
-        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.weight = nn.Parameter(torch.FloatTensor(self.in_features, self.out_features))
+        self.att_weight = nn.Parameter(torch.FloatTensor(2 * self.out_features, 1))
+        self.alpha = 0.2
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
         self.softmax = nn.Softmax(dim=1)
 
-        # Initialize parameters
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.xavier_uniform_(self.attention_vector)
+        init.xavier_uniform_(self.weight)
+        init.xavier_uniform_(self.att_weight)
 
-    def forward(self, nodes, neighbor_sets, num_sample=10, aggregation="mean"):
+    def forward(self, nodes, neighbors, num_sample=10, agg_type="max"):
         """
-        Aggregates neighbor embeddings for a batch of nodes.
-
-        Args:
-            nodes (list): List of target nodes.
-            neighbor_sets (list of sets): Each set contains the neighbors of a node.
-            num_sample (int): Number of neighbors to sample (None for all).
-            aggregation (str): Type of aggregation ("mean" for GCN, "sum" for GIN).
-
-        Returns:
-            torch.Tensor: Aggregated node embeddings.
+        nodes: list of central node indices
+        neighbors: list of neighbor sets for each node
+        num_sample: optional downsampling of neighbors
+        agg_type: 'mean' or 'max' pooling for GCN aggregation
         """
-        # Sample neighbors if necessary
+
         if num_sample is not None:
-            sampled_neighbors = [
-                set(random.sample(neigh, num_sample)) if len(neigh) >= num_sample else neigh
-                for neigh in neighbor_sets
-            ]
+            sampled_neighbors = [set(random.sample(nbrs, num_sample)) if len(nbrs) >= num_sample else nbrs
+                                 for nbrs in neighbors]
         else:
-            sampled_neighbors = neighbor_sets
+            sampled_neighbors = neighbors
 
-        # If using GCN mode, include self-loops
-        if self.gcn_mode:
-            sampled_neighbors = [neigh | {nodes[i]} for i, neigh in enumerate(sampled_neighbors)]
+        if self.gcn_style:
+            sampled_neighbors = [nbrs | {nodes[i]} for i, nbrs in enumerate(sampled_neighbors)]
 
-        # Flatten and map unique nodes
-        unique_nodes = list(set.union(*sampled_neighbors))
-        node_index = {node: idx for idx, node in enumerate(unique_nodes)}
+        all_unique_nodes = list(set.union(*sampled_neighbors))
+        node_to_index = {n: i for i, n in enumerate(all_unique_nodes)}
 
-        # Construct adjacency mask
-        row_indices = [i for i, neigh in enumerate(sampled_neighbors) for _ in neigh]
-        col_indices = [node_index[n] for neigh in sampled_neighbors for n in neigh]
+        row_indices = []
+        col_indices = []
+        for i, nbrs in enumerate(sampled_neighbors):
+            row_indices.extend([i] * len(nbrs))
+            col_indices.extend([node_to_index[n] for n in nbrs])
 
-        mask = torch.zeros(len(sampled_neighbors), len(unique_nodes), device=self.device)
+        mask = Variable(torch.zeros(len(sampled_neighbors), len(all_unique_nodes)))
         mask[row_indices, col_indices] = 1
 
-        # Load node and neighbor embeddings
-        node_features = self.features(torch.LongTensor(nodes).to(self.device))
-        neighbor_features = self.features(torch.LongTensor(unique_nodes).to(self.device))
+        zero_mask = -9e15 * torch.ones_like(mask)
 
-        # Apply different aggregation methods
-        if self.kernel == "GAT":
-            # GAT attention mechanism
-            node_transformed = node_features @ self.weight.T
-            neighbor_transformed = neighbor_features @ self.weight.T
-            num_nodes = node_transformed.shape[0]
-            num_neighbors = neighbor_transformed.shape[0]
+        if self.use_cuda:
+            mask = mask.cuda()
 
-            # Compute pairwise attention scores
-            combined = torch.cat(
-                [
-                    node_transformed.repeat(1, num_neighbors).view(num_nodes * num_neighbors, -1),
-                    neighbor_transformed.repeat(num_nodes, 1),
-                ],
-                dim=1
-            ).view(num_nodes, num_neighbors, -1)
+        neighbor_counts = mask.sum(1, keepdim=True)
+        neighbor_counts[neighbor_counts == 0] = 1
 
-            attention_scores = self.leaky_relu(combined @ self.attention_vector).squeeze(2)
-            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
-            attention_weights = self.softmax(attention_scores)
+        node_feats = self.features_fn(torch.LongTensor(nodes).cuda() if self.use_cuda else torch.LongTensor(nodes))
+        neighbor_feats = self.features_fn(torch.LongTensor(all_unique_nodes).cuda() if self.use_cuda else torch.LongTensor(all_unique_nodes))
 
-            aggregated_features = attention_weights @ neighbor_transformed
+        if self.mode == "GAT":
+            node_feats = torch.mm(node_feats, self.weight)
+            neighbor_feats = torch.mm(neighbor_feats, self.weight)
 
-        elif self.kernel == "GCN":
-            # Standard GCN-style mean aggregation
-            degree = mask.sum(1, keepdim=True).clamp(min=1)
-            mask = mask / degree  # Normalize by degree
-            aggregated_features = mask @ neighbor_features
+            N = node_feats.size(0)
+            M = neighbor_feats.size(0)
 
-        elif self.kernel == "GIN":
-            # Sum-based aggregation for GIN
-            aggregated_features = mask @ neighbor_features
+            a_input = torch.cat([
+                node_feats.repeat(1, M).view(N * M, -1),
+                neighbor_feats.repeat(N, 1)
+            ], dim=1).view(N, M, -1)
 
+            attn_scores = self.leakyrelu(torch.matmul(a_input, self.att_weight).squeeze(2))
+            attention = torch.where(mask > 0, attn_scores, zero_mask)
+            attention = self.softmax(attention)
+
+            output = attention.mm(neighbor_feats)
+
+        elif self.mode == "GCN":
+            if agg_type == "mean":
+                mask = mask.div(neighbor_counts)
+                output = mask.mm(neighbor_feats)
+            elif agg_type == "max":
+                outputs = []
+                for i, nbrs in enumerate(sampled_neighbors):
+                    if nbrs:
+                        embeddings = neighbor_feats[[node_to_index[n] for n in nbrs]]
+                        max_embed, _ = torch.max(embeddings, dim=0)
+                        outputs.append(max_embed)
+                    else:
+                        outputs.append(torch.zeros(neighbor_feats.size(1)).to(neighbor_feats.device))
+                output = torch.stack(outputs)
+        elif self.mode == "GIN":
+            output = mask.mm(neighbor_feats)
         else:
-            raise ValueError(f"Unsupported kernel type: {self.kernel}")
+            raise ValueError("Unknown aggregation mode")
 
-        return aggregated_features
+        return output
 
 
 class AttentionAggregator(nn.Module):
     """
-    Implements an attention-based neighborhood aggregation mechanism 
-    for graph-based learning.
+    Aggregates neighbor features using simple dot-product attention.
     """
 
-    def __init__(self, features, in_dim=4096, out_dim=1024, use_cuda=False, gcn_mode=False):
+    def __init__(self, features_fn, in_features=4096, out_features=1024, use_cuda=False, gcn_style=False):
         """
-        Args:
-            features (callable): Function mapping node IDs to feature tensors.
-            in_dim (int): Input feature dimension.
-            out_dim (int): Output feature dimension.
-            use_cuda (bool): Whether to use GPU.
-            gcn_mode (bool): If True, includes self-loops like GCN.
+        features_fn: function that returns feature vectors for given node indices
+        in_features: input feature dimension
+        out_features: output feature dimension
+        use_cuda: if True, computations are performed on GPU
+        gcn_style: whether to include self-loops in the neighbor set
         """
         super(AttentionAggregator, self).__init__()
-        
-        self.features = features
-        self.device = torch.device("cuda" if use_cuda else "cpu")
-        self.gcn_mode = gcn_mode
 
-        # Attention weight parameters
-        self.weight = nn.Parameter(torch.FloatTensor(out_dim, in_dim))
-        self.attention_vector = nn.Parameter(torch.FloatTensor(2 * out_dim, 1))
+        self.features_fn = features_fn
+        self.use_cuda = use_cuda
+        self.gcn_style = gcn_style
 
-        # Activation functions
-        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.in_features = in_features
+        self.out_features = out_features
         self.softmax = nn.Softmax(dim=1)
 
-        # Initialize weights using Xavier initialization
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.xavier_uniform_(self.attention_vector)
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.att_weight = nn.Parameter(torch.FloatTensor(2 * out_features, 1))
 
-    def forward(self, nodes, neighbor_sets, num_sample=10):
+        init.xavier_uniform_(self.weight)
+        init.xavier_uniform_(self.att_weight)
+
+    def forward(self, nodes, neighbors, num_sample=10):
         """
-        Aggregates feature representations of neighbors using attention.
-
-        Args:
-            nodes (list): List of nodes in a batch.
-            neighbor_sets (list of sets): Each set contains the neighbors of a node.
-            num_sample (int): Number of neighbors to sample (no sampling if None).
-
-        Returns:
-            torch.Tensor: Aggregated node embeddings.
+        nodes: list of node indices
+        neighbors: list of neighbor sets per node
+        num_sample: max number of neighbors to use per node
         """
-        # Sample neighbors if required
         if num_sample is not None:
-            sampled_neighbors = [
-                set(random.sample(neigh, num_sample)) if len(neigh) >= num_sample else neigh
-                for neigh in neighbor_sets
-            ]
+            sampled_neighbors = [set(random.sample(nbrs, num_sample)) if len(nbrs) >= num_sample else nbrs
+                                 for nbrs in neighbors]
         else:
-            sampled_neighbors = neighbor_sets
+            sampled_neighbors = neighbors
 
-        # Include self-loops in GCN mode
-        if self.gcn_mode:
-            sampled_neighbors = [neigh | {nodes[i]} for i, neigh in enumerate(sampled_neighbors)]
+        if self.gcn_style:
+            sampled_neighbors = [nbrs | {nodes[i]} for i, nbrs in enumerate(sampled_neighbors)]
 
-        # Flatten neighbors and create index mapping
-        unique_nodes = list(set.union(*sampled_neighbors))
-        node_index = {node: idx for idx, node in enumerate(unique_nodes)}
+        all_unique_nodes = list(set.union(*sampled_neighbors))
+        node_to_index = {n: i for i, n in enumerate(all_unique_nodes)}
 
-        # Construct adjacency mask
-        row_indices = [i for i, neigh in enumerate(sampled_neighbors) for _ in neigh]
-        col_indices = [node_index[n] for neigh in sampled_neighbors for n in neigh]
+        row_indices = []
+        col_indices = []
+        for i, nbrs in enumerate(sampled_neighbors):
+            row_indices.extend([i] * len(nbrs))
+            col_indices.extend([node_to_index[n] for n in nbrs])
 
-        mask = torch.zeros(len(sampled_neighbors), len(unique_nodes), device=self.device)
+        mask = Variable(torch.zeros(len(sampled_neighbors), len(all_unique_nodes)))
         mask[row_indices, col_indices] = 1
+        zero_mask = -9e15 * torch.ones_like(mask)
 
-        # Retrieve feature matrices for nodes and neighbors
-        node_features = self.features(torch.LongTensor(nodes).to(self.device))
-        neighbor_features = self.features(torch.LongTensor(unique_nodes).to(self.device))
+        if self.use_cuda:
+            mask = mask.cuda()
 
-        # Transform features using learned weights
-        node_transformed = node_features @ self.weight.T
-        neighbor_transformed = neighbor_features @ self.weight.T
+        node_feats = self.features_fn(torch.LongTensor(nodes).cuda() if self.use_cuda else torch.LongTensor(nodes))
+        neighbor_feats = self.features_fn(torch.LongTensor(all_unique_nodes).cuda() if self.use_cuda else torch.LongTensor(all_unique_nodes))
 
-        # Compute attention scores
-        num_nodes = node_transformed.shape[0]
-        num_neighbors = neighbor_transformed.shape[0]
+        attn_scores = node_feats.mm(neighbor_feats.t())
+        attention = torch.where(mask > 0, attn_scores, zero_mask)
+        attention = self.softmax(attention)
 
-        combined = torch.cat(
-            [
-                node_transformed.repeat(1, num_neighbors).view(num_nodes * num_neighbors, -1),
-                neighbor_transformed.repeat(num_nodes, 1),
-            ],
-            dim=1
-        ).view(num_nodes, num_neighbors, -1)
+        aggregated = attention.mm(neighbor_feats)
+        return aggregated
 
-        attention_scores = self.leaky_relu(combined @ self.attention_vector).squeeze(2)
-
-        # Apply mask to attention scores
-        attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
-        attention_weights = self.softmax(attention_scores)
-
-        # Compute weighted sum of neighbor embeddings
-        aggregated_features = attention_weights @ neighbor_transformed
-
-        return aggregated_features
