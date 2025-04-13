@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[3]:
 
 
 import numpy as np
@@ -34,30 +30,84 @@ feat_data = np.random.random((50000, feature_dim))
 # Start timer
 start_time = time.time()
 
-# Instantiate the model pipeline
-model = DiseasePredictionPipeline(
-    node_features=feat_data,
-    binary_labels=rare_patient,
-    num_classes=multi_class_num,
-    multilabels=labels,
-    graph=adj_lists,
-    feat_dim=feature_dim,
-    enc_depth=1,  # Depth of encoder to use during classification
-    enc_dims=train_enc_dims,
-    sample_sizes=num_samples,
-    train_idx=train_nodes,
-    test_idx=test_nodes,
-    kernel_type='GCN',
-    top_k=(1, 2, 3, 4, 5)
-)
+multi_class_num = 108
+feature_dim = 10000
+epoch = 8000
+batch_num = 200
+lr = 0.3
+feat_data = np.random.random((50000, feature_dim))
+train_enc_dim = [1000, 1000, 1000, 1000]
+t1 = time.time()
+model = DiseasesPredictor(feat_data=feat_data,
+                          b_labels=rare_patient,
+                          multi_class_num=108,
+                          labels=labels,
+                          adj_lists=adj_lists,
+                          feature_dim=feature_dim,
+                          train_enc_num=1,
+                          train_enc_dim=train_enc_dim,
+                          train_sample_num=[5, 5, 5, 5],
+                          train=train, test=test,
+                          kernel='GIN',
+                          topk=(1, 2, 3, 4, 5,))
 
-# Run the training and evaluation process
-model.execute(epochs, batch_size, learning_rate)
+model.run(epoch, batch_num, lr)  # epoch, batch_num, lr
+print(feature_dim, train_enc_dim)
+print("running time:", time.time()-t1, "s")
 
-# Output summary
-print("Feature dimension:", feature_dim)
-print("Encoder dimensions:", train_enc_dims)
-print("Total run time: {:.2f}s".format(time.time() - start_time))
+
+multi_class_num = 108
+feature_dim = 10000
+epoch = 8000
+batch_num = 200
+lr = 0.3
+feat_data = np.random.random((50000, feature_dim))
+train_enc_dim = [1000, 1000, 1000, 1000]
+t1 = time.time()
+model = DiseasesPredictor(feat_data=feat_data,
+                          b_labels=rare_patient,
+                          multi_class_num=108,
+                          labels=labels,
+                          adj_lists=adj_lists,
+                          feature_dim=feature_dim,
+                          train_enc_num=1,
+                          train_enc_dim=train_enc_dim,
+                          train_sample_num=[5, 5, 5, 5],
+                          train=train, test=test,
+                          kernel='GCN',
+                          topk=(1, 2, 3, 4, 5,),
+                          agg_type = "mean")
+
+model.run(epoch, batch_num, lr)  # epoch, batch_num, lr
+print(feature_dim, train_enc_dim)
+print("running time:", time.time()-t1, "s")
+
+
+multi_class_num = 108
+feature_dim = 10000
+epoch = 8000
+batch_num = 200
+lr = 0.3
+feat_data = np.random.random((50000, feature_dim))
+train_enc_dim = [1000, 1000, 1000, 1000]
+t1 = time.time()
+model = DiseasesPredictor(feat_data=feat_data,
+                          b_labels=rare_patient,
+                          multi_class_num=108,
+                          labels=labels,
+                          adj_lists=adj_lists,
+                          feature_dim=feature_dim,
+                          train_enc_num=1,
+                          train_enc_dim=train_enc_dim,
+                          train_sample_num=[5, 5, 5, 5],
+                          train=train, test=test,
+                          kernel='GCN',
+                          topk=(1, 2, 3, 4, 5,),
+                          agg_type = "max")
+
+model.run(epoch, batch_num, lr)  # epoch, batch_num, lr
+print(feature_dim, train_enc_dim)
+print("running time:", time.time()-t1, "s")
 
 
 # In[ ]:
